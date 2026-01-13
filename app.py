@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import sys
 import os
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from dataclasses import dataclass, field
+from datetime import date, timedelta
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -14,7 +14,6 @@ from PySide6.QtWidgets import (
 from excel_io import ExcelIO, H1, H2
 
 
-# Pfad bleibt gleich (Ordner), nur Dateiname ändert sich bei Jahreswechsel
 BASE_DIR = r"P:\10245_Dateiupload-Qliksense-VGSG-K5\03_Service GW und int Produktbetreuung\01_MOIA Technik"
 DEFAULT_FILENAME = "Stundennachweis DLV 2026 1.0.xlsm"
 
@@ -34,6 +33,9 @@ class State:
     d_from: date | None = None
     d_to: date | None = None
     month: date = date.today().replace(day=1)
+
+    # NEU: gefüllte Tage im aktuellen Monat (für Markierung)
+    filled_days: set[date] = field(default_factory=set)
 
 
 class RestDialog(QDialog):
@@ -84,17 +86,17 @@ class App(QWidget):
 
         self.state = State()
 
-        # Buttons merken (für Markierung & Ausgrauen)
+        # Buttons merken (Markierung/Ausgrauen)
         self.emp_buttons: list[QPushButton] = []
         self.proj_buttons: list[QPushButton] = []
         self.abs_buttons: list[QPushButton] = []
         self.hour_buttons: list[QPushButton] = []
 
-        # Dateiname (änderbar), Pfad bleibt BASE_DIR
+        # Dateiname (änderbar)
         self.filename = DEFAULT_FILENAME
         self.io = ExcelIO(build_excel_path(self.filename))
 
-        # Daten aus Excel
+        # Listen laden
         try:
             self.emps, self.projs, self.abss = self.io.load_lists()
         except Exception as e:
@@ -110,7 +112,7 @@ class App(QWidget):
     def _build_ui(self):
         root = QVBoxLayout(self)
 
-        # --- Dateiname-Leiste ---
+        # Dateiname-Leiste
         file_row = QHBoxLayout()
         file_row.addWidget(QLabel("Excel-Dateiname:"))
         self.file_edit = QLineEdit()
@@ -130,7 +132,7 @@ class App(QWidget):
         main = QHBoxLayout()
         root.addLayout(main)
 
-        # Left panel
+        # Left
         left = QVBoxLayout()
         main.addLayout(left, 1)
 
@@ -163,7 +165,7 @@ class App(QWidget):
         left.addWidget(QLabel("Abwesenheit"))
         left.addWidget(self._tile_area(self.abss, self._pick_abs, self.abs_buttons))
 
-        # Right panel (calendar + actions)
+        # Right (Calendar)
         right = QVBoxLayout()
         main.addLayout(right, 1)
 
@@ -216,13 +218,12 @@ class App(QWidget):
         scroll.setMinimumHeight(140)
         return scroll
 
-    # ---------------- Visual State (Markierung + Ausgrauen) ----------------
+    # ---------------- Visual State ----------------
     def _set_btn_style(self, btn: QPushButton, selected: bool, enabled: bool):
         if not enabled:
             btn.setEnabled(False)
             btn.setStyleSheet("background:#3a3a46; color:#9a9aaa;")
             return
-
         btn.setEnabled(True)
         if selected:
             btn.setStyleSheet("background:#32a852; color:white; font-weight:600;")
@@ -236,19 +237,15 @@ class App(QWidget):
         proj_enabled = (mode == "PROJ")
         abs_enabled = (mode == "ABS")
 
-        # Mitarbeiter immer aktiv
         for b in self.emp_buttons:
             self._set_btn_style(b, selected=(b.property("tile_value") == s.emp), enabled=True)
 
-        # Projekte nur im PROJ-Modus
         for b in self.proj_buttons:
             self._set_btn_style(b, selected=(b.property("tile_value") == s.proj), enabled=proj_enabled)
 
-        # Abwesenheit nur im ABS-Modus
         for b in self.abs_buttons:
             self._set_btn_style(b, selected=(b.property("tile_value") == s.abs_type), enabled=abs_enabled)
 
-        # Stunden nur im PROJ-Modus
         for b in self.hour_buttons:
             try:
                 val = float(b.text().replace(",", "."))
@@ -260,12 +257,22 @@ class App(QWidget):
                 enabled=proj_enabled
             )
 
+    # ---------------- Excel -> gefüllte Tage laden ----------------
+    def _refresh_filled_days(self):
+        s = self.state
+        if not s.emp:
+            s.filled_days = set()
+            return
+        try:
+            s.filled_days = self.io.get_filled_days_for_employee(emp=s.emp, month=s.month)
+        except Exception:
+            s.filled_days = set()
+
     # ---------------- Info / Calendar ----------------
     def _render_info(self):
         s = self.state
 
         def fmt(d): return d.strftime("%d.%m.%Y") if d else "—"
-
         d1 = s.d_from
         d2 = s.d_to or s.d_from
         if d1 and d2 and d2 < d1:
@@ -299,8 +306,7 @@ class App(QWidget):
             lab.setAlignment(Qt.AlignCenter)
             self.cal_grid.addWidget(lab, 0, i)
 
-        first = m
-        start_offset = first.weekday()  # Monday=0
+        start_offset = m.weekday()  # Monday=0
         nxt_month = (m.replace(day=28) + timedelta(days=4)).replace(day=1)
         last_day = (nxt_month - timedelta(days=1)).day
 
@@ -312,14 +318,22 @@ class App(QWidget):
         day = 1
         row = 1
         col = start_offset
+
         while day <= last_day:
             btn = QPushButton(str(day))
             btn.setMinimumHeight(32)
 
             d = m.replace(day=day)
+
+            # Wochenende Grundfarbe
             if d.weekday() >= 5:
                 btn.setStyleSheet("background:#3a3a46; color:white;")
 
+            # NEU: Bereits gefüllt -> blau (nur wenn nicht Wochenende überschreibt, ist ok)
+            if d in s.filled_days:
+                btn.setStyleSheet("background:#2f6fb3; color:white;")
+
+            # Auswahl -> grün (übersticht alles)
             if d_from and d_to and d_from <= d <= d_to:
                 btn.setStyleSheet("background:#32a852; color:white; font-weight:600;")
 
@@ -355,7 +369,9 @@ class App(QWidget):
 
     def _pick_emp(self, x: str):
         self.state.emp = x
+        self._refresh_filled_days()
         self._render_info()
+        self._render_calendar()
         self._apply_visual_state()
 
     def _set_mode(self, m: str):
@@ -411,6 +427,7 @@ class App(QWidget):
         self.state.month = prev
         self.state.d_from = None
         self.state.d_to = None
+        self._refresh_filled_days()
         self._render_info()
         self._render_calendar()
 
@@ -420,6 +437,7 @@ class App(QWidget):
         self.state.month = nxt
         self.state.d_from = None
         self.state.d_to = None
+        self._refresh_filled_days()
         self._render_info()
         self._render_calendar()
 
@@ -432,6 +450,7 @@ class App(QWidget):
         s.abs_type = ""
         s.d_from = None
         s.d_to = None
+        s.filled_days = set()
         self._render_info()
         self._render_calendar()
         self._apply_visual_state()
@@ -492,6 +511,10 @@ class App(QWidget):
             )
             return
 
+        # Nach Speichern: gefüllte Tage neu laden (damit direkt blau wird)
+        self._refresh_filled_days()
+        self._render_calendar()
+
         # Restlogik (3,5h)
         if s.mode == "PROJ" and abs(float(s.hrs) - H1) < 1e-9:
             if d1 == d2:
@@ -525,7 +548,10 @@ class App(QWidget):
                 self._reset()
                 return
 
-        QMessageBox.information(self, "Gespeichert", f"Gespeichert: {ok} Tag(e)." + (f"\nFehlgeschlagen: {fail}" if fail else ""))
+        QMessageBox.information(
+            self, "Gespeichert",
+            f"Gespeichert: {ok} Tag(e)." + (f"\nFehlgeschlagen: {fail}" if fail else "")
+        )
         self._reset()
 
 
