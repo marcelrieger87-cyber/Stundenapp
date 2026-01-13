@@ -1,8 +1,9 @@
 from __future__ import annotations
+
 import sys
 import os
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -13,8 +14,14 @@ from PySide6.QtWidgets import (
 from excel_io import ExcelIO, H1, H2
 
 
-EXCEL_PATH = r"P:\10245_Dateiupload-Qliksense-VGSG-K5\03_Service GW und int Produktbetreuung\01_MOIA Technik\Stundennachweis DLV 2026 1.0.xlsm"
-# Tipp: Falls P: mal nicht gemappt ist, wäre ein UNC-Pfad (\\server\share\...) zuverlässiger.
+# Pfad bleibt gleich (Ordner), nur Dateiname ändert sich bei Jahreswechsel
+BASE_DIR = r"P:\10245_Dateiupload-Qliksense-VGSG-K5\03_Service GW und int Produktbetreuung\01_MOIA Technik"
+DEFAULT_FILENAME = "Stundennachweis DLV 2026 1.0.xlsm"
+
+
+def build_excel_path(filename: str) -> str:
+    filename = (filename or "").strip()
+    return os.path.join(BASE_DIR, filename)
 
 
 @dataclass
@@ -75,8 +82,17 @@ class App(QWidget):
         super().__init__()
         self.setWindowTitle("StundenApp (Desktop)")
 
-        self.io = ExcelIO(EXCEL_PATH)
         self.state = State()
+
+        # Buttons merken (für Markierung & Ausgrauen)
+        self.emp_buttons: list[QPushButton] = []
+        self.proj_buttons: list[QPushButton] = []
+        self.abs_buttons: list[QPushButton] = []
+        self.hour_buttons: list[QPushButton] = []
+
+        # Dateiname (änderbar), Pfad bleibt BASE_DIR
+        self.filename = DEFAULT_FILENAME
+        self.io = ExcelIO(build_excel_path(self.filename))
 
         # Daten aus Excel
         try:
@@ -88,10 +104,23 @@ class App(QWidget):
         self._build_ui()
         self._render_info()
         self._render_calendar()
+        self._apply_visual_state()
 
     # ---------------- UI ----------------
     def _build_ui(self):
         root = QVBoxLayout(self)
+
+        # --- Dateiname-Leiste ---
+        file_row = QHBoxLayout()
+        file_row.addWidget(QLabel("Excel-Dateiname:"))
+        self.file_edit = QLineEdit()
+        self.file_edit.setText(self.filename)
+        self.file_edit.setPlaceholderText("z.B. Stundennachweis DLV 2027 1.0.xlsm")
+        file_row.addWidget(self.file_edit, 1)
+        reload_btn = QPushButton("Neu laden")
+        reload_btn.clicked.connect(self._reload_from_filename)
+        file_row.addWidget(reload_btn)
+        root.addLayout(file_row)
 
         self.info = QLabel("")
         self.info.setFrameShape(QFrame.StyledPanel)
@@ -106,7 +135,7 @@ class App(QWidget):
         main.addLayout(left, 1)
 
         left.addWidget(QLabel("Mitarbeiter"))
-        left.addWidget(self._tile_area(self.emps, self._pick_emp))
+        left.addWidget(self._tile_area(self.emps, self._pick_emp, self.emp_buttons))
 
         row = QHBoxLayout()
         btn_p = QPushButton("Projekt")
@@ -118,20 +147,21 @@ class App(QWidget):
         left.addLayout(row)
 
         left.addWidget(QLabel("Projekte"))
-        left.addWidget(self._tile_area(self.projs, self._pick_proj))
+        left.addWidget(self._tile_area(self.projs, self._pick_proj, self.proj_buttons))
 
         row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Stunden"))
         b1 = QPushButton(str(H1).replace(".", ","))
         b2 = QPushButton(str(H2).replace(".", ","))
         b1.clicked.connect(lambda: self._pick_hours(H1))
         b2.clicked.connect(lambda: self._pick_hours(H2))
-        row2.addWidget(QLabel("Stunden"))
         row2.addWidget(b1)
         row2.addWidget(b2)
         left.addLayout(row2)
+        self.hour_buttons = [b1, b2]
 
         left.addWidget(QLabel("Abwesenheit"))
-        left.addWidget(self._tile_area(self.abss, self._pick_abs))
+        left.addWidget(self._tile_area(self.abss, self._pick_abs, self.abs_buttons))
 
         # Right panel (calendar + actions)
         right = QVBoxLayout()
@@ -161,7 +191,7 @@ class App(QWidget):
         actions.addWidget(reset, 1)
         right.addLayout(actions)
 
-    def _tile_area(self, items: list[str], handler):
+    def _tile_area(self, items: list[str], handler, store_list: list[QPushButton]):
         cont = QWidget()
         grid = QGridLayout(cont)
         grid.setSpacing(6)
@@ -170,8 +200,11 @@ class App(QWidget):
         for t in items[:60]:
             btn = QPushButton(t)
             btn.setMinimumHeight(28)
+            btn.setProperty("tile_value", t)
             btn.clicked.connect(lambda _, x=t: handler(x))
             grid.addWidget(btn, r, c)
+            store_list.append(btn)
+
             c += 1
             if c >= 3:
                 c = 0
@@ -183,10 +216,56 @@ class App(QWidget):
         scroll.setMinimumHeight(140)
         return scroll
 
-    # ---------------- State / Render ----------------
+    # ---------------- Visual State (Markierung + Ausgrauen) ----------------
+    def _set_btn_style(self, btn: QPushButton, selected: bool, enabled: bool):
+        if not enabled:
+            btn.setEnabled(False)
+            btn.setStyleSheet("background:#3a3a46; color:#9a9aaa;")
+            return
+
+        btn.setEnabled(True)
+        if selected:
+            btn.setStyleSheet("background:#32a852; color:white; font-weight:600;")
+        else:
+            btn.setStyleSheet("background:#4a4a58; color:white;")
+
+    def _apply_visual_state(self):
+        s = self.state
+        mode = s.mode
+
+        proj_enabled = (mode == "PROJ")
+        abs_enabled = (mode == "ABS")
+
+        # Mitarbeiter immer aktiv
+        for b in self.emp_buttons:
+            self._set_btn_style(b, selected=(b.property("tile_value") == s.emp), enabled=True)
+
+        # Projekte nur im PROJ-Modus
+        for b in self.proj_buttons:
+            self._set_btn_style(b, selected=(b.property("tile_value") == s.proj), enabled=proj_enabled)
+
+        # Abwesenheit nur im ABS-Modus
+        for b in self.abs_buttons:
+            self._set_btn_style(b, selected=(b.property("tile_value") == s.abs_type), enabled=abs_enabled)
+
+        # Stunden nur im PROJ-Modus
+        for b in self.hour_buttons:
+            try:
+                val = float(b.text().replace(",", "."))
+            except Exception:
+                val = 0.0
+            self._set_btn_style(
+                b,
+                selected=(s.hrs is not None and abs(float(s.hrs) - val) < 1e-9),
+                enabled=proj_enabled
+            )
+
+    # ---------------- Info / Calendar ----------------
     def _render_info(self):
         s = self.state
+
         def fmt(d): return d.strftime("%d.%m.%Y") if d else "—"
+
         d1 = s.d_from
         d2 = s.d_to or s.d_from
         if d1 and d2 and d2 < d1:
@@ -204,7 +283,6 @@ class App(QWidget):
         )
 
     def _render_calendar(self):
-        # clear grid
         while self.cal_grid.count():
             item = self.cal_grid.takeAt(0)
             w = item.widget()
@@ -222,13 +300,10 @@ class App(QWidget):
             self.cal_grid.addWidget(lab, 0, i)
 
         first = m
-        # monday=0.. sunday=6
-        start_offset = (first.weekday())  # Monday=0
-        # days in month
+        start_offset = first.weekday()  # Monday=0
         nxt_month = (m.replace(day=28) + timedelta(days=4)).replace(day=1)
         last_day = (nxt_month - timedelta(days=1)).day
 
-        # selection normalize
         d_from = s.d_from
         d_to = s.d_to or s.d_from
         if d_from and d_to and d_to < d_from:
@@ -242,12 +317,11 @@ class App(QWidget):
             btn.setMinimumHeight(32)
 
             d = m.replace(day=day)
-            is_weekend = d.weekday() >= 5
-            if is_weekend:
-                btn.setStyleSheet("opacity:0.8;")
+            if d.weekday() >= 5:
+                btn.setStyleSheet("background:#3a3a46; color:white;")
 
             if d_from and d_to and d_from <= d <= d_to:
-                btn.setStyleSheet("background:#32a852; color:white;")
+                btn.setStyleSheet("background:#32a852; color:white; font-weight:600;")
 
             btn.clicked.connect(lambda _, x=day: self._click_day(x))
             self.cal_grid.addWidget(btn, row, col)
@@ -259,9 +333,30 @@ class App(QWidget):
                 row += 1
 
     # ---------------- Handlers ----------------
+    def _reload_from_filename(self):
+        new_name = self.file_edit.text().strip()
+        if not new_name:
+            QMessageBox.warning(self, "Hinweis", "Bitte einen Dateinamen eingeben.")
+            return
+
+        self.filename = new_name
+        self.io = ExcelIO(build_excel_path(self.filename))
+
+        try:
+            self.emps, self.projs, self.abss = self.io.load_lists()
+        except Exception as e:
+            QMessageBox.critical(self, "Fehler", f"Datei konnte nicht geladen werden:\n{e}")
+            return
+
+        QMessageBox.information(
+            self, "OK",
+            "Listen aus Excel neu geladen.\nBitte App neu starten, damit die Kacheln aktualisiert werden."
+        )
+
     def _pick_emp(self, x: str):
         self.state.emp = x
         self._render_info()
+        self._apply_visual_state()
 
     def _set_mode(self, m: str):
         self.state.mode = m
@@ -271,24 +366,28 @@ class App(QWidget):
             self.state.proj = ""
             self.state.hrs = None
         self._render_info()
+        self._apply_visual_state()
 
     def _pick_proj(self, x: str):
         self.state.mode = "PROJ"
         self.state.proj = x
         self.state.abs_type = ""
         self._render_info()
+        self._apply_visual_state()
 
     def _pick_hours(self, h: float):
         if self.state.mode != "PROJ" or not self.state.proj:
             return
         self.state.hrs = h
         self._render_info()
+        self._apply_visual_state()
 
     def _pick_abs(self, x: str):
         if self.state.mode != "ABS":
             return
         self.state.abs_type = x
         self._render_info()
+        self._apply_visual_state()
 
     def _click_day(self, day: int):
         s = self.state
@@ -335,6 +434,7 @@ class App(QWidget):
         s.d_to = None
         self._render_info()
         self._render_calendar()
+        self._apply_visual_state()
 
     def _save(self):
         s = self.state
@@ -369,7 +469,6 @@ class App(QWidget):
                 QMessageBox.warning(self, "Hinweis", "Bitte Abwesenheitsart anklicken.")
                 return
 
-        # Schreiben
         try:
             ok, fail = self.io.write_range(
                 emp=s.emp,
@@ -433,7 +532,7 @@ class App(QWidget):
 def main():
     app = QApplication(sys.argv)
     w = App()
-    w.resize(980, 620)
+    w.resize(980, 650)
     w.show()
     sys.exit(app.exec())
 
