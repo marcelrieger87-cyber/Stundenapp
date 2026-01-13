@@ -25,9 +25,7 @@ jobs:
 
       - name: Build EXE
         run: |
-          pyinstaller --noconfirm --onefile --windowed app.py --name StundenApp --icon "%CD%\app.ico"
-
-
+          pyinstaller --noconfirm --onefile --windowed app.py --name StundenApp --icon "${{ github.workspace }}\app.ico"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
