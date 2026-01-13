@@ -2,7 +2,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Optional, Tuple, List
+from typing import Optional
 
 import openpyxl
 
@@ -51,7 +51,6 @@ def _as_date(v) -> Optional[date]:
         return v.date()
     if isinstance(v, date):
         return v
-    # Excel can store as float sometimes; openpyxl usually converts dates already
     return None
 
 
@@ -96,6 +95,50 @@ class ExcelIO:
             wb.close()
 
     # -------------------------
+    # Public: Kalender-Markierung (gefüllte Tage)
+    # -------------------------
+    def get_filled_days_for_employee(self, emp: str, month: date) -> set[date]:
+        """
+        Liefert alle Tage (Mo-Fr + Wochenende egal), an denen im Monatsblatt
+        für den Mitarbeiter-Block irgendeine Zelle (Projekt oder Abwesenheit) gefüllt ist.
+        """
+        emp = (emp or "").strip()
+        if not emp:
+            return set()
+
+        wb = self._open_workbook()
+        try:
+            ws = self._get_month_sheet(wb, month)
+            if ws is None:
+                return set()
+
+            block = self._find_employee_block(ws, emp)
+            if block is None:
+                return set()
+
+            filled: set[date] = set()
+            max_row = ws.max_row
+
+            for r in range(DATE_FIRST_ROW, max_row + 1):
+                dv = _as_date(ws.cell(r, DATE_COL).value)
+                if not dv:
+                    continue
+                # Nur aktueller Monat
+                if dv.year != month.year or dv.month != month.month:
+                    continue
+
+                # Check alle Zellen im Mitarbeiterblock (inkl. Abs-Spalte)
+                for c in range(block.start_col, block.start_col + block.width):
+                    v = ws.cell(r, c).value
+                    if v not in (None, "", 0):
+                        filled.add(dv)
+                        break
+
+            return filled
+        finally:
+            wb.close()
+
+    # -------------------------
     # Public: Schreiben (mehrere Tage)
     # -------------------------
     def write_range(
@@ -132,7 +175,6 @@ class ExcelIO:
                         fail += 1
                 cur += timedelta(days=1)
 
-            # Speichern
             wb.save(self.file_path)
         finally:
             wb.close()
@@ -144,14 +186,24 @@ class ExcelIO:
     # -------------------------
     def _open_workbook(self):
         last_err = None
-        for i in range(self.retries):
+        for _ in range(self.retries):
             try:
-                # keep_vba=True damit .xlsm-Makros erhalten bleiben
                 return openpyxl.load_workbook(self.file_path, keep_vba=True)
             except Exception as e:
                 last_err = e
                 time.sleep(self.retry_wait_sec)
         raise RuntimeError(f"Excel-Datei konnte nicht geöffnet werden (evtl. gesperrt): {last_err}")
+
+    # -------------------------
+    # Internal: Monatsblatt holen
+    # -------------------------
+    def _get_month_sheet(self, wb, month: date):
+        nm = month_sheet_name(month)
+        if nm in wb.sheetnames:
+            return wb[nm]
+        if nm == "März" and "Maerz" in wb.sheetnames:
+            return wb["Maerz"]
+        return None
 
     # -------------------------
     # Internal: Unique List aus Spalte
@@ -181,10 +233,7 @@ class ExcelIO:
         hrs: float,
         abs_type: str,
     ) -> bool:
-        sheet_name = month_sheet_name(dt)
-        ws = wb[sheet_name] if sheet_name in wb.sheetnames else None
-        if ws is None and sheet_name == "März" and "Maerz" in wb.sheetnames:
-            ws = wb["Maerz"]
+        ws = self._get_month_sheet(wb, dt)
         if ws is None:
             return False
 
@@ -199,13 +248,11 @@ class ExcelIO:
         abs_col = block.abs_col
 
         if mode == "ABS":
-            # Abwesenheit in letzter Spalte, Projektzellen löschen
             ws.cell(day_row, abs_col).value = abs_type
             for c in range(block.start_col, abs_col):
                 ws.cell(day_row, c).value = None
             return True
 
-        # PROJ
         proj_col = self._find_project_col(ws, block, proj)
         if proj_col == 0:
             return False
@@ -221,8 +268,7 @@ class ExcelIO:
         max_row = ws.max_row
         target = dt
         for r in range(DATE_FIRST_ROW, max_row + 1):
-            v = ws.cell(r, DATE_COL).value
-            dv = _as_date(v)
+            dv = _as_date(ws.cell(r, DATE_COL).value)
             if dv and dv == target:
                 return r
         return 0
@@ -233,8 +279,6 @@ class ExcelIO:
     def _find_employee_block(self, ws, emp: str) -> Optional[EmployeeBlock]:
         emp_key = _normalize_key(emp)
         c = FIRST_EMP_COL
-
-        # Wir scannen bis wir "einen sinnvollen Stopp" haben: mehrere leere Header hintereinander
         empty_streak = 0
         max_c = ws.max_column
 
@@ -250,21 +294,14 @@ class ExcelIO:
                 empty_streak += 1
 
             c = next_c
-
-            # Stop wenn lange nichts mehr kommt
             if empty_streak >= 15:
                 break
 
         return None
 
     def _header_cell_value_and_width(self, ws, row: int, col: int) -> tuple[str, int, int]:
-        """
-        returns (value, width, next_col)
-        width berücksichtigt MergeArea in Zeile 3.
-        """
         cell = ws.cell(row, col)
 
-        # Ist die Zelle Teil eines Merge-Bereichs?
         merged_range = None
         for rng in ws.merged_cells.ranges:
             if rng.min_row <= row <= rng.max_row and rng.min_col <= col <= rng.max_col:
@@ -275,15 +312,10 @@ class ExcelIO:
             top_left = ws.cell(merged_range.min_row, merged_range.min_col)
             val = top_left.value
             width = merged_range.max_col - merged_range.min_col + 1
-            # Wichtig: wir müssen auf die Startspalte des Merge springen
             start_col = merged_range.min_col
             next_col = start_col + width
-            # Falls wir mitten im Merge gelandet sind: korrigieren
-            if col != start_col:
-                return (str(val).strip() if val is not None else ""), width, next_col
             return (str(val).strip() if val is not None else ""), width, next_col
 
-        # Nicht gemerged
         val = cell.value
         return (str(val).strip() if val is not None else ""), 1, col + 1
 
@@ -292,7 +324,6 @@ class ExcelIO:
     # -------------------------
     def _find_project_col(self, ws, block: EmployeeBlock, proj: str) -> int:
         proj_key = _normalize_key(proj)
-        # bis start+width-2, letzte ist Abs
         for c in range(block.start_col, block.start_col + block.width - 1):
             v = ws.cell(SUBHEADER_ROW, c).value
             if _normalize_key(str(v) if v is not None else "") == proj_key:
